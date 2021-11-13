@@ -1,9 +1,7 @@
 use async_graphql::dataloader::{DataLoader, Loader};
 use async_graphql::futures_util::TryStreamExt;
 use async_graphql::http::{playground_source, GraphQLPlaygroundConfig};
-use async_graphql::{
-    Context, EmptyMutation, EmptySubscription, FieldError, Object, Result, Schema, SimpleObject,
-};
+use async_graphql::{Context, EmptySubscription, FieldError, Object, Result, Schema, SimpleObject};
 use async_std::task;
 use async_trait::async_trait;
 use sqlx::{Pool, Postgres};
@@ -17,27 +15,31 @@ pub struct Exercise {
     name: String,
 }
 
-pub struct ExerciseLoader(Pool<Postgres>);
+#[derive(sqlx::FromRow, Clone, SimpleObject)]
+pub struct Routine {
+    id: i32,
+    name: String,
+}
 
-impl ExerciseLoader {
+pub struct RoutineLoader(Pool<Postgres>);
+
+impl RoutineLoader {
     fn new(postgres_pool: Pool<Postgres>) -> Self {
         Self(postgres_pool)
     }
 }
 
 #[async_trait]
-impl Loader<i32> for ExerciseLoader {
-    type Value = Exercise;
+impl Loader<i32> for RoutineLoader {
+    type Value = Routine;
     type Error = FieldError;
 
     async fn load(&self, keys: &[i32]) -> Result<HashMap<i32, Self::Value>, Self::Error> {
-        println!("load exercise by batch {:?}", keys);
-
-        let query = "SELECT id, name FROM exercises WHERE id IN (SELECT * FROM UNNEST($1))";
+        let query = "SELECT id, name FROM routines WHERE id IN (SELECT * FROM UNNEST($1))";
         let exercise = sqlx::query_as(&query)
             .bind(keys)
             .fetch(&self.0)
-            .map_ok(|exercise: Exercise| (exercise.id, exercise))
+            .map_ok(|routine: Routine| (routine.id, routine))
             .try_collect()
             .await?;
 
@@ -49,15 +51,6 @@ struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
-    async fn exercise(&self, ctx: &Context<'_>, id: i32) -> Result<Option<Exercise>> {
-        let exercise = ctx
-            .data_unchecked::<DataLoader<ExerciseLoader>>()
-            .load_one(id)
-            .await?;
-
-        Ok(exercise)
-    }
-
     async fn exercises(&self, ctx: &Context<'_>) -> Result<Vec<Exercise>> {
         let pool = ctx.data_unchecked::<sqlx::Pool<sqlx::Postgres>>();
 
@@ -67,6 +60,45 @@ impl QueryRoot {
             .await?;
 
         Ok(exercises)
+    }
+
+    async fn routine(&self, ctx: &Context<'_>, id: i32) -> Result<Option<Routine>> {
+        let routine = ctx
+            .data_unchecked::<DataLoader<RoutineLoader>>()
+            .load_one(id)
+            .await?;
+
+        Ok(routine)
+    }
+
+    async fn routines(&self, ctx: &Context<'_>) -> Result<Vec<Routine>> {
+        let pool = ctx.data_unchecked::<sqlx::Pool<sqlx::Postgres>>();
+
+        let routines = sqlx::query_as!(Routine, "SELECT id, name FROM routines")
+            .fetch(pool)
+            .try_collect()
+            .await?;
+
+        Ok(routines)
+    }
+}
+
+struct MutationRoot;
+
+#[Object]
+impl MutationRoot {
+    async fn create_routine(&self, ctx: &Context<'_>, name: String) -> Result<Routine> {
+        let pool = ctx.data_unchecked::<sqlx::Pool<sqlx::Postgres>>();
+
+        let routine = sqlx::query_as!(
+            Routine,
+            "INSERT INTO routines (name) VALUES ( $1 ) RETURNING id, name",
+            name
+        )
+        .fetch_one(pool)
+        .await?;
+
+        Ok(routine)
     }
 }
 
@@ -78,29 +110,8 @@ async fn run() -> Result<()> {
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set in env");
     let postgres_pool: Pool<Postgres> = Pool::connect(&database_url).await?;
 
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS exercises (
-            id INTEGER PRIMARY KEY NOT NULL,
-            name TEXT NOT NULL
-        );
-        "#,
-    )
-    .execute(&postgres_pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-        INSERT INTO exercises (id, name)
-        VALUES (1, 'Squat'), (2, 'Deadlift'), (3, 'Row')
-        ON CONFLICT (id) DO NOTHING;
-        "#,
-    )
-    .execute(&postgres_pool)
-    .await?;
-
-    let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
-        .data(DataLoader::new(ExerciseLoader::new(postgres_pool.clone())))
+    let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+        .data(DataLoader::new(RoutineLoader::new(postgres_pool.clone())))
         .data(postgres_pool.clone())
         .finish();
 
