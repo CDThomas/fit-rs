@@ -9,8 +9,15 @@ use std::collections::HashMap;
 use std::env;
 use tide::{http::mime, Body, Response, StatusCode};
 
-#[derive(sqlx::FromRow, Clone, SimpleObject)]
+#[derive(sqlx::FromRow, Clone)]
 pub struct Exercise {
+    id: i32,
+    name: String,
+    main_muscle_worked_id: i32,
+}
+
+#[derive(sqlx::FromRow, Clone, SimpleObject)]
+pub struct Muscle {
     id: i32,
     name: String,
 }
@@ -47,6 +54,54 @@ impl Loader<i32> for RoutineLoader {
     }
 }
 
+pub struct MuscleLoader(Pool<Postgres>);
+
+impl MuscleLoader {
+    fn new(postgres_pool: Pool<Postgres>) -> Self {
+        Self(postgres_pool)
+    }
+}
+
+#[async_trait]
+impl Loader<i32> for MuscleLoader {
+    type Value = Muscle;
+    type Error = FieldError;
+
+    async fn load(&self, keys: &[i32]) -> Result<HashMap<i32, Self::Value>, Self::Error> {
+        let query = "SELECT id, name FROM muscles WHERE id IN (SELECT * FROM UNNEST($1))";
+        let exercise = sqlx::query_as(&query)
+            .bind(keys)
+            .fetch(&self.0)
+            .map_ok(|muscle: Muscle| (muscle.id, muscle))
+            .try_collect()
+            .await?;
+
+        Ok(exercise)
+    }
+}
+
+#[Object(extends)]
+impl Exercise {
+    #[graphql(external)]
+    async fn id(&self) -> i32 {
+        self.id
+    }
+
+    #[graphql(external)]
+    async fn name(&self) -> String {
+        self.name.to_owned()
+    }
+
+    async fn main_muscle_worked(&self, ctx: &Context<'_>) -> Result<Option<Muscle>> {
+        let muscle = ctx
+            .data_unchecked::<DataLoader<MuscleLoader>>()
+            .load_one(self.main_muscle_worked_id)
+            .await?;
+
+        Ok(muscle)
+    }
+}
+
 struct QueryRoot;
 
 #[Object]
@@ -54,10 +109,13 @@ impl QueryRoot {
     async fn exercises(&self, ctx: &Context<'_>) -> Result<Vec<Exercise>> {
         let pool = ctx.data_unchecked::<sqlx::Pool<sqlx::Postgres>>();
 
-        let exercises = sqlx::query_as!(Exercise, "SELECT id, name FROM exercises")
-            .fetch(pool)
-            .try_collect()
-            .await?;
+        let exercises = sqlx::query_as!(
+            Exercise,
+            "SELECT id, name, main_muscle_worked_id FROM exercises"
+        )
+        .fetch(pool)
+        .try_collect()
+        .await?;
 
         Ok(exercises)
     }
@@ -87,6 +145,30 @@ struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
+    async fn create_exercise(
+        &self,
+        ctx: &Context<'_>,
+        name: String,
+        main_muscle_worked_id: i32,
+    ) -> Result<Exercise> {
+        let pool = ctx.data_unchecked::<sqlx::Pool<sqlx::Postgres>>();
+
+        let exercise = sqlx::query_as!(
+            Exercise,
+            r#"
+INSERT INTO exercises (name, main_muscle_worked_id)
+VALUES ( $1, $2 )
+RETURNING id, name, main_muscle_worked_id
+            "#,
+            name,
+            main_muscle_worked_id
+        )
+        .fetch_one(pool)
+        .await?;
+
+        Ok(exercise)
+    }
+
     async fn create_routine(&self, ctx: &Context<'_>, name: String) -> Result<Routine> {
         let pool = ctx.data_unchecked::<sqlx::Pool<sqlx::Postgres>>();
 
@@ -111,6 +193,7 @@ async fn run() -> Result<()> {
     let postgres_pool: Pool<Postgres> = Pool::connect(&database_url).await?;
 
     let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+        .data(DataLoader::new(MuscleLoader::new(postgres_pool.clone())))
         .data(DataLoader::new(RoutineLoader::new(postgres_pool.clone())))
         .data(postgres_pool.clone())
         .finish();
