@@ -58,11 +58,15 @@ impl QueryRoot {
         Ok(exercise)
     }
 
-    async fn exercises(&self, _ctx: &Context<'_>) -> Result<Vec<Exercise>> {
-        Ok(vec![Exercise {
-            id: 1,
-            name: "Hi".to_owned(),
-        }])
+    async fn exercises(&self, ctx: &Context<'_>) -> Result<Vec<Exercise>> {
+        let pool = ctx.data_unchecked::<sqlx::Pool<sqlx::Postgres>>();
+
+        let exercises = sqlx::query_as!(Exercise, "SELECT id, name FROM exercises")
+            .fetch(pool)
+            .try_collect()
+            .await?;
+
+        Ok(exercises)
     }
 }
 
@@ -96,7 +100,8 @@ async fn run() -> Result<()> {
     .await?;
 
     let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
-        .data(DataLoader::new(ExerciseLoader::new(postgres_pool)))
+        .data(DataLoader::new(ExerciseLoader::new(postgres_pool.clone())))
+        .data(postgres_pool.clone())
         .finish();
 
     let mut app = tide::new();
@@ -117,47 +122,4 @@ async fn run() -> Result<()> {
     app.listen("127.0.0.1:8000").await?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use async_std::prelude::*;
-    use serde_json::{json, Value};
-    use std::time::Duration;
-
-    #[test]
-    fn sample() -> Result<()> {
-        task::block_on(async {
-            let server: task::JoinHandle<Result<()>> = task::spawn(async move {
-                run().await?;
-                Ok(())
-            });
-
-            let client: task::JoinHandle<Result<()>> = task::spawn(async move {
-                task::sleep(Duration::from_millis(1000)).await;
-
-                let string = surf::post("http://127.0.0.1:8000/graphql")
-                    .body(
-                        Body::from(r#"{"query":"{ exercise1: exercise(id: 1) {id, name} exercise2: exercise(id: 2) {id, name} exercise3: exercise(id: 3) {id, name} exercise4: exercise(id: 4) {id, name} }"}"#),
-                    )
-                    .header("Content-Type", "application/json")
-                    .recv_string()
-                    .await?;
-                println!("{}", string);
-
-                let v: Value = serde_json::from_str(&string)?;
-                assert_eq!(v["data"]["exercise1"], json!({"id": 1, "name": "Squat"}));
-                assert_eq!(v["data"]["exercise2"], json!({"id": 2, "name": "Deadlift"}));
-                assert_eq!(v["data"]["exercise3"], json!({"id": 3, "name": "Row"}));
-                assert_eq!(v["data"]["exercise4"], json!(null));
-
-                Ok(())
-            });
-
-            server.race(client).await?;
-
-            Ok(())
-        })
-    }
 }
