@@ -80,14 +80,12 @@ impl Loader<i32> for MuscleLoader {
     }
 }
 
-#[Object(extends)]
+#[Object]
 impl Exercise {
-    #[graphql(external)]
     async fn id(&self) -> i32 {
         self.id
     }
 
-    #[graphql(external)]
     async fn name(&self) -> String {
         self.name.to_owned()
     }
